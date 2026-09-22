@@ -78,6 +78,34 @@ OpenClEngine::OpenClEngine(const PlatformIndex platformIndex, const DeviceIndex 
 
     m_DeviceInfo = GetDeviceInfo(m_PlatformIndex)[m_DeviceIndex];
 
+#if defined(KTT_POWER_USAGE_ROCM)
+    const std::string vendor = platform.GetInfo().GetVendor();
+    if (vendor.find("AMD") != std::string::npos || vendor.find("Advanced Micro Devices") != std::string::npos)
+    {
+        try
+        {
+            m_PowerManager = std::make_unique<RocmPowerManager>(*m_Context, m_DeviceIndex);
+        }
+        catch (const KttException& exception)
+        {
+            Logger::LogWarning(std::string("Failed to initialize power measurement, continuing without it: ") + exception.what());
+        }
+    }
+#elif defined(KTT_POWER_USAGE_IGCL)
+    const std::string vendor = platform.GetInfo().GetVendor();
+    if (vendor.find("Intel") != std::string::npos)
+    {
+        try
+        {
+            m_PowerManager = std::make_unique<IgclPowerManager>(*m_Context, m_DeviceIndex);
+        }
+        catch (const KttException& exception)
+        {
+            Logger::LogWarning(std::string("Failed to initialize power measurement, continuing without it: ") + exception.what());
+        }
+    }
+#endif
+
 #if defined(KTT_PROFILING_GPA) || defined(KTT_PROFILING_GPA_LEGACY)
     InitializeGpa();
 #endif // KTT_PROFILING_GPA || KTT_PROFILING_GPA_LEGACY
@@ -150,6 +178,35 @@ OpenClEngine::OpenClEngine(const ComputeApiInitializer& initializer, std::vector
 
     m_DeviceInfo = GetDeviceInfo(m_PlatformIndex)[m_DeviceIndex];
 
+#if defined(KTT_POWER_USAGE_ROCM)
+    // Only initialize ROCm power manager for AMD platforms
+    const std::string vendor = platform.GetInfo().GetVendor();
+    if (vendor.find("AMD") != std::string::npos || vendor.find("Advanced Micro Devices") != std::string::npos)
+    {
+        try
+        {
+            m_PowerManager = std::make_unique<RocmPowerManager>(*m_Context, m_DeviceIndex);
+        }
+        catch (const KttException& exception)
+        {
+            Logger::LogWarning(std::string("Failed to initialize power measurement, continuing without it: ") + exception.what());
+        }
+    }
+#elif defined(KTT_POWER_USAGE_IGCL)
+    const std::string vendor = platform.GetInfo().GetVendor();
+    if (vendor.find("Intel") != std::string::npos)
+    {
+        try
+        {
+            m_PowerManager = std::make_unique<IgclPowerManager>(*m_Context, m_DeviceIndex);
+        }
+        catch (const KttException& exception)
+        {
+            Logger::LogWarning(std::string("Failed to initialize power measurement, continuing without it: ") + exception.what());
+        }
+    }
+#endif
+
 #if defined(KTT_PROFILING_GPA) || defined(KTT_PROFILING_GPA_LEGACY)
     InitializeGpa();
 #endif // KTT_PROFILING_GPA || KTT_PROFILING_GPA_LEGACY
@@ -190,11 +247,6 @@ void OpenClEngine::Sanitize(const QueueId queueId)
 ComputeActionId OpenClEngine::RunKernelAsync(const KernelComputeData& data, const QueueId queueId, const bool powerMeasurementAllowed,
     const std::optional<PreciseMeasurementParameters>& preciseParams)
 {
-    // Silence warning about unused parameter
-    (void)powerMeasurementAllowed;
-
-    // OpenCL does not support power measurement, but preciseParams can be used for stable timing
-    // No exception is thrown - the parameters are used for timing stabilization if provided
     if (!ContainsKey(m_Queues, queueId))
     {
         throw KttException("Invalid queue index: " + std::to_string(queueId));
@@ -227,6 +279,15 @@ ComputeActionId OpenClEngine::RunKernelAsync(const KernelComputeData& data, cons
     const auto& queue = *m_Queues[queueId];
     timer.Stop();
 
+#if defined(KTT_POWER_USAGE_ROCM) || defined(KTT_POWER_USAGE_IGCL)
+    if (powerMeasurementAllowed && m_PowerManager != nullptr)
+    {
+        m_PowerManager->StartCollection();
+    }
+#else
+    (void)powerMeasurementAllowed;
+#endif
+
     auto action = kernel->Launch(queue, data.GetGlobalSize(), data.GetLocalSize());
 
     // OpenCL does not support power measurement, but preciseParams can be used for stable timing
@@ -255,6 +316,12 @@ ComputeActionId OpenClEngine::RunKernelAsync(const KernelComputeData& data, cons
     action->SetComputeId(data.GetUniqueIdentifier());
     const auto id = action->GetId();
     m_ComputeActions[id] = std::move(action);
+#if defined(KTT_POWER_USAGE_ROCM) || defined(KTT_POWER_USAGE_IGCL)
+    if (powerMeasurementAllowed && m_PowerManager != nullptr)
+    {
+        m_PowerMeasuredActions.insert(id);
+    }
+#endif
     return id;
 }
 
@@ -268,6 +335,22 @@ ComputationResult OpenClEngine::WaitForComputeAction(const ComputeActionId id)
     auto& action = *m_ComputeActions[id];
     action.WaitForFinish();
     auto result = action.GenerateResult();
+
+#if defined(KTT_POWER_USAGE_ROCM) || defined(KTT_POWER_USAGE_IGCL)
+    if (m_PowerMeasuredActions.erase(id) != 0)
+    {
+        m_PowerManager->EndCollection();
+        result.SetPowerUsage(m_PowerManager->GetPowerUsage());
+        result.SetTemperature(m_PowerManager->GetTemperature());
+        result.SetSMFrequency(m_PowerManager->GetSMFrequency());
+        result.SetMemoryFrequency(m_PowerManager->GetMemoryFrequency());
+        result.SetFanSpeed(m_PowerManager->GetFanSpeed());
+        if (const auto energy = m_PowerManager->GetEnergyConsumption(); energy.has_value())
+        {
+            result.SetEnergyConsumption(*energy);
+        }
+    }
+#endif
 
     m_ComputeActions.erase(id);
     return result;

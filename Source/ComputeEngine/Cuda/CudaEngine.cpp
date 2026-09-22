@@ -25,7 +25,8 @@
 #endif // KTT_PROFILING_CUPTI
 
 #ifdef KTT_POWER_USAGE_NVML
-#include <ComputeEngine/Cuda/Nvml/NvmlPowerSubscription.h>
+#include <ComputeEngine/PowerMeasurement/Nvml/NvmlPowerManager.h>
+#include <ComputeEngine/PowerMeasurement/Nvml/NvmlPowerSubscription.h>
 #endif // KTT_POWER_USAGE_NVML
 
 #include <iostream>
@@ -84,7 +85,14 @@ CudaEngine::CudaEngine(const DeviceIndex deviceIndex, const uint32_t queueCount)
 #endif // KTT_PROFILING_CUPTI
 
 #if defined(KTT_POWER_USAGE_NVML)
-    m_PowerManager = std::make_unique<NvmlPowerManager>(*m_Context, m_DeviceIndex);
+    try
+    {
+        m_PowerManager = std::make_unique<NvmlPowerManager>(*m_Context, m_DeviceIndex);
+    }
+    catch (const KttException& exception)
+    {
+        Logger::LogWarning(std::string("Failed to initialize power measurement, continuing without it: ") + exception.what());
+    }
 #endif // KTT_POWER_USAGE_NVML
 }
 
@@ -142,7 +150,14 @@ CudaEngine::CudaEngine(const ComputeApiInitializer& initializer, std::vector<Que
 #endif // KTT_PROFILING_CUPTI
 
 #if defined(KTT_POWER_USAGE_NVML)
-    m_PowerManager = std::make_unique<NvmlPowerManager>(*m_Context, m_DeviceIndex);
+    try
+    {
+        m_PowerManager = std::make_unique<NvmlPowerManager>(*m_Context, m_DeviceIndex);
+    }
+    catch (const KttException& exception)
+    {
+        Logger::LogWarning(std::string("Failed to initialize power measurement, continuing without it: ") + exception.what());
+    }
 #endif // KTT_POWER_USAGE_NVML
 }
 
@@ -224,13 +239,15 @@ ComputeActionId CudaEngine::RunKernelAsync(const KernelComputeData& data, const 
     std::vector<uint32_t> sumSMFreq;
     std::vector<uint32_t> sumMemFreq;
     std::vector<int32_t> sumFanSpeed;
-    if (powerMeasurementAllowed) {
+    std::vector<double> energySamples;
+    const bool measurePower = powerMeasurementAllowed && m_PowerManager != nullptr;
+    if (measurePower) {
         subscription = std::make_unique<NvmlPowerSubscription>(*m_PowerManager);
         //uint64_t energyBegin = m_PowerManager->GetTotalDeviceEnergy();
     }
     // Robust power measurement timer - only used when preciseParams is provided
     Timer pwrTimer;
-    if (powerMeasurementAllowed && preciseParams.has_value())
+    if (measurePower && preciseParams.has_value())
     {
         pwrTimer.Start();
     }
@@ -240,7 +257,7 @@ ComputeActionId CudaEngine::RunKernelAsync(const KernelComputeData& data, const 
     int consideredIters = 1;
     // Robust power measurement - run kernel multiple times until power stabilizes
     // This is only done when powerMeasurementAllowed and preciseParams is provided
-    if (powerMeasurementAllowed && preciseParams.has_value())
+    if (measurePower && preciseParams.has_value())
     {
         action->WaitForFinish();
         std::vector<ktt::Nanoseconds> durationSamples;
@@ -256,6 +273,10 @@ ComputeActionId CudaEngine::RunKernelAsync(const KernelComputeData& data, const 
         sumSMFreq.push_back(m_PowerManager->GetSMFrequency());
         sumMemFreq.push_back(m_PowerManager->GetMemoryFrequency());
         sumFanSpeed.push_back(m_PowerManager->GetFanSpeed());
+        if (const auto energy = m_PowerManager->GetEnergyConsumption(); energy.has_value())
+        {
+            energySamples.push_back(energy.value());
+        }
         
         while (looping) {
             auto a = kernel->Launch(stream, data.GetGlobalSize(), data.GetLocalSize(), arguments, sharedMemorySize);
@@ -266,6 +287,10 @@ ComputeActionId CudaEngine::RunKernelAsync(const KernelComputeData& data, const 
             sumSMFreq.push_back(m_PowerManager->GetSMFrequency());
             sumMemFreq.push_back(m_PowerManager->GetMemoryFrequency());
             sumFanSpeed.push_back(m_PowerManager->GetFanSpeed());
+            if (const auto energy = m_PowerManager->GetEnergyConsumption(); energy.has_value())
+            {
+                energySamples.push_back(energy.value());
+            }
             execs++;
 
             // decide whether loop or stop
@@ -309,7 +334,7 @@ ComputeActionId CudaEngine::RunKernelAsync(const KernelComputeData& data, const 
         Logger::LogInfo("Power has been measured from " + std::to_string(consideredIters) + " kernel runs (out of " + std::to_string(execs) + " runs)");
     }
 
-    if (powerMeasurementAllowed) {
+    if (measurePower) {
         // Simple power measurement (single execution) - used when preciseParams is NOT provided
         if (!preciseParams.has_value())
         {
@@ -319,6 +344,10 @@ ComputeActionId CudaEngine::RunKernelAsync(const KernelComputeData& data, const 
             sumSMFreq.push_back(m_PowerManager->GetSMFrequency());
             sumMemFreq.push_back(m_PowerManager->GetMemoryFrequency());
             sumFanSpeed.push_back(m_PowerManager->GetFanSpeed());
+            if (const auto energy = m_PowerManager->GetEnergyConsumption(); energy.has_value())
+            {
+                energySamples.push_back(energy.value());
+            }
         }
         const uint32_t powerUsage = static_cast<uint32_t>(std::accumulate(sumPwr.cend()-consideredIters, sumPwr.cend(), 0)) / static_cast<uint32_t>(consideredIters);
         action->SetPowerUsage(powerUsage);
@@ -335,6 +364,13 @@ ComputeActionId CudaEngine::RunKernelAsync(const KernelComputeData& data, const 
             fanSpeed = static_cast<int32_t>(std::accumulate(sumFanSpeed.cend()-consideredIters, sumFanSpeed.cend(), 0)) / static_cast<int32_t>(consideredIters);
         }
         action->SetFanSpeed(fanSpeed);
+
+        if (!energySamples.empty())
+        {
+            const double energy = std::accumulate(energySamples.cbegin(), energySamples.cend(), 0.0)
+                / static_cast<double>(energySamples.size());
+            action->SetEnergyConsumption(energy);
+        }
     }
 #else
     // Power measurement is NOT available - use preciseParams for stable timing only
@@ -1137,6 +1173,15 @@ std::string CudaEngine::GetDefaultCompilerOptions() const
         "cuDeviceGetAttribute");
     CheckError(cuDeviceGetAttribute(&computeCapabilityMinor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, m_Context->GetDevice()),
         "cuDeviceGetAttribute");
+
+    int nvrtcMajor = 0;
+    int nvrtcMinor = 0;
+    CheckError(nvrtcVersion(&nvrtcMajor, &nvrtcMinor), "nvrtcVersion");
+
+    if (nvrtcMajor < 12 && computeCapabilityMajor == 8 && computeCapabilityMinor >= 9)
+    {
+        computeCapabilityMinor = 6;
+    }
     
     std::string result = "--gpu-architecture=compute_" + std::to_string(computeCapabilityMajor)
         + std::to_string(computeCapabilityMinor);
