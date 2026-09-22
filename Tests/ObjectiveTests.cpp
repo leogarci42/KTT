@@ -173,7 +173,7 @@ TEST_CASE("Energy objective end-to-end on CUDA device", "[Objective]")
     const float scalarValue = 3.0f;
 
     const ktt::KernelDefinitionId definition = tuner->AddKernelDefinition("vectorAddition", source,
-        ktt::DimensionVector(numberOfElements), ktt::DimensionVector(32), {"float"});
+        ktt::DimensionVector(numberOfElements), ktt::DimensionVector(32));
     const ktt::ArgumentId aId = tuner->AddArgumentVector(a, ktt::ArgumentAccessType::ReadOnly);
     const ktt::ArgumentId bId = tuner->AddArgumentVector(b, ktt::ArgumentAccessType::ReadOnly);
     const ktt::ArgumentId resultId = tuner->AddArgumentVector(result, ktt::ArgumentAccessType::WriteOnly);
