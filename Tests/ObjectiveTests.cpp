@@ -181,6 +181,11 @@ TEST_CASE("Energy objective end-to-end on CUDA device", "[Objective]")
     tuner->SetArguments(definition, {aId, bId, resultId, scalarId});
 
     const ktt::KernelId kernel = tuner->CreateSimpleKernel("Addition", definition);
+
+    // At least one tuning parameter is required, otherwise no configurations
+    // are generated and Tune() returns an empty result set.
+    tuner->AddParameter(kernel, "BLOCK_SIZE", std::vector<uint64_t>{32, 64});
+
     tuner->SetTuningObjective(kernel,
         std::make_unique<ktt::WeightedEnergyPerformanceObjective>(0.5, 0.5, 1'000'000.0, 0.01));
 
